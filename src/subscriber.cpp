@@ -4,17 +4,16 @@
 
 #include <ethernet_packetdef.h>
 
-Subscriber::Subscriber(int cam_id)
+Subscriber::Subscriber() :
+  frames_ready_guard(frames_ready_mutex)
 {
-  std::cout << "Creating subscriber n. " << cam_id << std::endl;
   sock = socket(AF_INET, SOCK_STREAM, 0);
 
   si_self.sin_family = AF_INET;
-  si_self.sin_port = htons(BASE_PORT + cam_id);
+  si_self.sin_port = htons(BASE_PORT);
   si_self.sin_addr.s_addr = htonl(INADDR_ANY);
 
   bind(sock, (struct sockaddr *) &si_self, sizeof(si_self));
-  std::cout << "Constructed subscriber n. " << cam_id << std::endl;
 }
 
 Subscriber::~Subscriber()
@@ -24,10 +23,16 @@ Subscriber::~Subscriber()
 }
 
 // TODO atomic to signal from receive thread and mutexes to avoid corrupted frames
-OVCImage Subscriber::getFrame()
+std::array<OVCImage, Subscriber::NUM_IMAGERS> Subscriber::getFrames()
 {
-
-  return ret_img;
+  while (frames_received / NUM_IMAGERS == 0)
+  {
+    frames_ready_var.wait(frames_ready_guard);
+  }
+  frames_received = 0;
+  // Lock mutex to avoid overwriting in receive thread
+  std::lock_guard<std::mutex> lock(frames_mutex);
+  return ret_imgs;
 }
 
 void Subscriber::receiveThread()
@@ -40,17 +45,21 @@ void Subscriber::receiveThread()
   int cur_off = 0;
   int frame_size = 0;
   int exp_status = 0;
+  int camera_id = 0;
+  std::unique_lock<std::mutex> frames_lock(frames_mutex, std::defer_lock);
   ether_tx_packet_t recv_pkt;
   while (1)
   {
+    std::string camera_name;
     if (state_ == ReceiveState::WAIT_HEADER)
     {
       // Receive a header
       if (cur_off > sizeof(recv_pkt))
       {
+        // We received a whole header and a beginning of frame before finishing reading the previous one
         std::cout << "UNHANDLED CASE ERROR" << std::endl;
       }
-      else if (cur_off < sizeof(recv_pkt))
+      else
       {
         while (cur_off < sizeof(recv_pkt))
         {
@@ -58,61 +67,34 @@ void Subscriber::receiveThread()
           cur_off += recv_len;
         }
       }
-      else
-      {
-        // Received a whole header, all is good
-        std::cout << "Whole header received" << std::endl;
-      }
       frame_size = recv_pkt.frame.height * recv_pkt.frame.step;
-      std::cout << "Received a header with frame_id " << recv_pkt.frame.frame_id << 
-        " height " << recv_pkt.frame.height << " width = " << recv_pkt.frame.width << std::endl;
-      std::cout << "Camera is " << recv_pkt.frame.camera_name << " format is " << recv_pkt.frame.data_type << std::endl;
+      camera_name = recv_pkt.frame.camera_name;
+      //std::cout << "Received a header with frame_id " << recv_pkt.frame.frame_id << 
+      //  " height " << recv_pkt.frame.height << " width = " << recv_pkt.frame.width << std::endl;
       // Allocate CV mat
-      ret_img.image.create(recv_pkt.frame.height, recv_pkt.frame.width, CV_8UC1); // TODO flexible data type, for now only yuv420
-      if (/*recv_len != sizeof(recv_pkt)*/ false)
-      {
-        std::cout << "Incomplete header received" << std::endl;
-      }
-      else
-      {
-        cur_off = 0;
-        state_ = ReceiveState::WAIT_PAYLOAD;
-      }
+      ret_imgs[camera_id].image.create(recv_pkt.frame.height, recv_pkt.frame.width, CV_8UC1); // TODO flexible data type, for now only yuv420
+      cur_off = 0;
+      state_ = ReceiveState::WAIT_PAYLOAD;
     }
     else if (state_ == ReceiveState::WAIT_PAYLOAD)
     {
-      int recv_len;
+      frames_lock.lock();
       while (cur_off < frame_size)
       {
-        recv_len = recv(recv_sock, &ret_img.image.data[cur_off], frame_size - cur_off, MSG_WAITALL);
-        //recv_len = read(recv_sock, buff, std::min((int)sizeof(buff), frame_size - cur_off));
+        int recv_len = recv(recv_sock, &ret_imgs[camera_id].image.data[cur_off], frame_size - cur_off, MSG_WAITALL);
         cur_off += recv_len;
-        //usleep(10);
-        // TODO memcpy's here
       }
+      frames_lock.unlock();
       cur_off -= frame_size;
-      if (cur_off > 0)
-      {
-        // We received a part of the header
-        //memcpy(&recv_pkt,  &buff[recv_len - cur_off], cur_off);
-      }
 
       state_ = ReceiveState::WAIT_HEADER;
-
+      ++frames_received;
+      if (frames_received % NUM_IMAGERS == 0)
+      {
+        // All frames received, notify userspace
+        frames_ready_var.notify_all();
+      }
+      camera_id = (camera_id + 1) % NUM_IMAGERS;
     }
-
-    continue;
-    //int recv_len = recvfrom(sock, recv_pkt.data, sizeof(recv_pkt), 0, (struct sockaddr*)&si_other, &sock_len);
-    int recv_len = read(recv_sock, recv_pkt.data, sizeof(recv_pkt));
-    //std::cout << "Received packet of size " << recv_len << " status is " << recv_pkt.status << std::endl;
-    if (recv_pkt.status != exp_status)
-    {
-      std::cout << "UNEXPECTED STATUS MISMATCH " << exp_status << " - " << recv_pkt.status << std::endl;
-      exp_status = recv_pkt.status + 1;
-    }
-    else
-      exp_status++;
-    std::cout << "Received packet of size " << recv_len << " with status " << recv_pkt.status << std::endl;
   }
-
 }

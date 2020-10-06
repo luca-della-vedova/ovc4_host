@@ -1,19 +1,24 @@
-
 #include <thread>
+#include <iostream>
 
 #include <subscriber.hpp>
 
-const std::vector<int> CAMERA_IDS = {2,4};
-
 int main(int argc, char **argv)
 {
-  std::vector<std::unique_ptr<std::thread>> threads;
-  std::vector<std::unique_ptr<Subscriber>> subs;
-  for (int i = 0; i < CAMERA_IDS.size(); ++i)
+  Subscriber sub;
+  std::thread thread(&Subscriber::receiveThread, &sub);
+  while (1)
   {
-    subs.push_back(std::make_unique<Subscriber>(CAMERA_IDS[i]));
-    threads.push_back(std::make_unique<std::thread>(&Subscriber::receiveThread, subs[i].get()));
+    auto frames = sub.getFrames();
+    std::cout << "Got a pair of frames" << std::endl;
+    cv::Mat frame1, frame2;
+    cv::cvtColor(frames[0].image, frame1, cv::COLOR_YUV2BGR_I420);
+    cv::cvtColor(frames[1].image, frame2, cv::COLOR_YUV2BGR_I420);
+    cv::imshow("Right", frame1);
+    cv::waitKey(1);
+    cv::imshow("Left", frame2);
+    cv::waitKey(1);
   }
-  threads[0]->join();
+  thread.join();
   return 0;
 }
